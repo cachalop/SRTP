@@ -43,8 +43,6 @@ class Packet:
         if len(data) < 12:
             return None
         
-        # p_type   +   window   +   Length   +   seqnum
-        #  [0-1]        [2-7]       [8-20]       [21-31]   
         header = struct.unpack('!I', data[0:4])[0] # [0] car .unpack() renvoie un tuple 
         timestamp = struct.unpack('!I', data[4:8])[0]
         crc1 = struct.unpack('!I', data[8:12])[0]
