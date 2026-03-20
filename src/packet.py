@@ -25,7 +25,7 @@ class Packet:
         packet_NBO = header_NBO + struct.pack('!I', crc1)
         
         # on ajoute le contenu du fichier apres CRC1
-        packet_NBO = header_NBO + self.payload
+        packet_NBO += self.payload
 
         # ajout du CRC2 si on a un contenu
         if self.length > 0:
