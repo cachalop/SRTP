@@ -1,202 +1,140 @@
-import argparse
-import os
 import socket
-import sys
+import struct
+import zlib
 import time
+import argparse
+import sys
 from urllib.parse import urlparse
 
-from packet import Packet, PTYPE_DATA, PTYPE_ACK, MAX_WINDOW, SEQ_MOD
-
-
-# Paramètres principaux
-RECV_BUFFER_SIZE = 63
-SOCKET_TIMEOUT = 0.2
-REQUEST_RETRY = 0.8
-
-
-# Log sur stderr (imposé par les consignes)
-def log(msg):
+def print_err(msg):
     print(msg, file=sys.stderr)
 
+def encode_header(packet_type, window, length, seqnum, timestamp):
+    header_int = (packet_type << 30) | (window << 24) | (length << 11) | seqnum
+    partial_header = struct.pack("!II", header_int, timestamp)
+    crc1 = zlib.crc32(partial_header)
+    return partial_header + struct.pack("!I", crc1)
 
-# Timestamp simple basé sur le temps courant
-def now_ts():
-    return int(time.monotonic() * 1000) & 0xFFFFFFFF
+def decode_header(header_bytes):
+    if len(header_bytes) != 12:
+        raise ValueError("L'entête ne fait pas 12 octets !")
+    header_int, timestamp, crc1_recu = struct.unpack("!III", header_bytes)
+    if zlib.crc32(header_bytes[:8]) != crc1_recu:
+        raise ValueError("Erreur CRC1 : entête corrompu !")
+    packet_type = (header_int >> 30) & 0x3
+    window = (header_int >> 24) & 0x3F
+    length = (header_int >> 11) & 0x1FFF
+    seqnum = header_int & 0x7FF
+    return packet_type, window, length, seqnum, timestamp
 
+def lire_paquet_recu(paquet_bytes):
+    if len(paquet_bytes) < 12:
+        raise ValueError("Paquet trop court !")
+    p_type, p_win, p_len, p_seq, p_time = decode_header(paquet_bytes[:12])
+    
+    if p_len == 0:
+        return p_type, p_win, p_len, p_seq, p_time, b""
+        
+    taille_attendue = 12 + p_len + 4 
+    if len(paquet_bytes) < taille_attendue:
+        raise ValueError("Paquet tronqué par le réseau !")
+        
+    payload = paquet_bytes[12 : 12+p_len]
+    crc2_recu = struct.unpack("!I", paquet_bytes[12+p_len : 12+p_len+4])[0]
+    
+    if zlib.crc32(payload) != crc2_recu:
+        raise ValueError("Erreur CRC2 : payload corrompu !")
+        
+    return p_type, p_win, p_len, p_seq, p_time, payload
 
-# Différence circulaire entre numéros de séquence
-def seq_diff(a, b):
-    return (a - b) % SEQ_MOD
-
-
-# Vérifie si un seqnum est dans la fenêtre de réception
-def in_window(seq, base, size):
-    return seq_diff(seq, base) < size
-
-
-# Parse l'URL HTTP fournie au client
-def parse_server_url(url):
-    parsed = urlparse(url)
-
-    if parsed.scheme != "http":
-        raise ValueError("URL must start with http://")
-    if parsed.hostname is None:
-        raise ValueError("missing hostname")
-    if parsed.port is None:
-        raise ValueError("missing port")
-
-    path = parsed.path or "/"
-    return parsed.hostname, parsed.port, path
-
-
-# Nombre de places libres dans le buffer de réception
-def free_slots(buffered_count):
-    return max(0, min(MAX_WINDOW, RECV_BUFFER_SIZE - buffered_count))
-
-
-# Envoie un ACK cumulatif au serveur
-def send_ack(sock, addr, next_expected, window_value, timestamp):
-    pkt = Packet(
-        ptype=PTYPE_ACK,
-        window=window_value,
-        seqnum=next_expected,
-        payload=b"",
-        timestamp=timestamp,
-    )
-    sock.sendto(pkt.encode(), addr)
+def envoyer_ack(sock, adresse_dest, prochain_seqnum_attendu, timestamp_recu, espaces_libres):
+    window_client = min(63, max(0, espaces_libres))
+    entete_ack = encode_header(2, window_client, 0, prochain_seqnum_attendu, timestamp_recu)
+    sock.sendto(entete_ack, adresse_dest)
 
 
-def run_client(servername, save_path):
-    # Résolution de l'adresse serveur
-    host, port, path = parse_server_url(servername)
-    server_addr = socket.getaddrinfo(
-        host, port, socket.AF_INET6, socket.SOCK_DGRAM
-    )[0][4]
-
-    # Construction de la requête HTTP 0.9
-    request_payload = f"GET {path}".encode("ascii")
-    request_packet = Packet(
-        ptype=PTYPE_DATA,
-        window=1,
-        seqnum=0,
-        payload=request_payload,
-        timestamp=now_ts(),
-    )
-
-    # Socket UDP IPv6
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    sock.settimeout(SOCKET_TIMEOUT)
-
-    # État de réception
-    expected_seq = 0
-    recv_buffer = {}
-    last_data_timestamp = 0
-    first_data_received = False
-    request_last_sent = 0.0
-
-    # Prépare le fichier de sortie
-    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-
-    with open(save_path, "wb") as f:
-        log(f"Receiving {path} into {save_path}")
-
-        while True:
-            now = time.monotonic()
-
-            # Retransmission périodique de la requête GET si aucune réponse
-            if not first_data_received and now - request_last_sent >= REQUEST_RETRY:
-                request_packet.timestamp = now_ts()
-                sock.sendto(request_packet.encode(), server_addr)
-                request_last_sent = now
-
-            try:
-                raw, addr = sock.recvfrom(2048)
-            except socket.timeout:
-                # En cas de timeout, on renvoie un ACK si on a déjà reçu des données
-                if first_data_received:
-                    current_window = free_slots(len(recv_buffer))
-                    send_ack(sock, server_addr, expected_seq, current_window, last_data_timestamp)
-                continue
-
-            # Ignore les paquets venant d'autres sources
-            if addr[:2] != server_addr[:2]:
-                continue
-
-            pkt = Packet.decode(raw)
-
-            # Ignore paquets invalides
-            if pkt is None:
-                if first_data_received:
-                    current_window = free_slots(len(recv_buffer))
-                    send_ack(sock, server_addr, expected_seq, current_window, last_data_timestamp)
-                continue
-
-            # On ne traite que les DATA
-            if pkt.ptype != PTYPE_DATA:
-                continue
-
-            # Ignore paquets hors fenêtre
-            if not in_window(pkt.seqnum, expected_seq, RECV_BUFFER_SIZE):
-                current_window = free_slots(len(recv_buffer))
-                send_ack(sock, server_addr, expected_seq, current_window, last_data_timestamp)
-                continue
-
-            first_data_received = True
-            last_data_timestamp = pkt.timestamp
-
-            # Paquet attendu
-            if pkt.seqnum == expected_seq:
-                # Fin de transfert (DATA vide)
-                if pkt.length == 0:
-                    expected_seq = (expected_seq + 1) % SEQ_MOD
-                    current_window = free_slots(len(recv_buffer))
-                    send_ack(sock, server_addr, expected_seq, current_window, last_data_timestamp)
-                    break
-
-                # Écriture directe
-                f.write(pkt.payload)
-                expected_seq = (expected_seq + 1) % SEQ_MOD
-
-                # Consomme les paquets déjà reçus en avance
-                while expected_seq in recv_buffer:
-                    buffered_pkt = recv_buffer.pop(expected_seq)
-
-                    if buffered_pkt.length == 0:
-                        expected_seq = (expected_seq + 1) % SEQ_MOD
-                        current_window = free_slots(len(recv_buffer))
-                        send_ack(sock, server_addr, expected_seq, current_window, buffered_pkt.timestamp)
-                        sock.close()
-                        log("Transfer complete")
-                        return
-
-                    f.write(buffered_pkt.payload)
-                    expected_seq = (expected_seq + 1) % SEQ_MOD
-
-            else:
-                # Paquet hors ordre → stockage
-                if pkt.seqnum not in recv_buffer:
-                    recv_buffer[pkt.seqnum] = pkt
-
-            # Envoi ACK cumulatif
-            current_window = free_slots(len(recv_buffer))
-            send_ack(sock, server_addr, expected_seq, current_window, last_data_timestamp)
-
-    sock.close()
-    log("Transfer complete")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("servername", help="http://hostname:port/path/to/file")
-    parser.add_argument("--save", default="./llm.model", help="destination file")
-    args = parser.parse_args()
-
-    try:
-        run_client(args.servername, args.save)
-    except Exception as exc:
-        log(f"error: {exc}")
-        raise SystemExit(1)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Client SRTP C'Hokayy")
+    parser.add_argument("servername", type=str, help="URL du serveur (ex: http://[::1]:8080/llm/small)")
+    parser.add_argument("--save", type=str, default="11m.model", help="Chemin du fichier de sauvegarde")
+    args = parser.parse_args()
+
+    url_decodee = urlparse(args.servername)
+    DEST_HOST = url_decodee.hostname 
+    DEST_PORT = url_decodee.port if url_decodee.port else 8080
+    CHEMIN_DEMANDE = url_decodee.path
+    FICHIER_SORTIE = args.save
+
+    client_socket = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    client_socket.settimeout(5.0) 
+
+    
+    requete_http = f"GET {CHEMIN_DEMANDE}".encode('ascii')
+  
+    entete_requete = encode_header(1, 63, len(requete_http), 0, int(time.time()))
+    crc2_requete = struct.pack("!I", zlib.crc32(requete_http))
+    client_socket.sendto(entete_requete + requete_http + crc2_requete, (DEST_HOST, DEST_PORT))
+    print_err(f" Requête envoyée : GET {CHEMIN_DEMANDE} vers [{DEST_HOST}]:{DEST_PORT}")
+
+ 
+    seqnum_attendu = 1 
+    buffer_reception = {} 
+    transfert_termine = False
+
+    try:
+        fichier = open(FICHIER_SORTIE, "wb")
+        print_err(f" Attente du fichier (sauvegarde dans {FICHIER_SORTIE})...")
+
+        while not transfert_termine:
+            try:
+                paquet, adresse_serveur = client_socket.recvfrom(2000)
+            except socket.timeout:
+                print_err(" Timeout critique : Le serveur ne répond plus.")
+                break
+            
+            try:
+                p_type, p_win, p_len, p_seq, p_time, payload = lire_paquet_recu(paquet)
+                
+                if p_type == 1: 
+                    
+                    if p_len == 0 and p_seq == seqnum_attendu: 
+                        print_err("Paquet de fin (Length=0) reçu. Transfert terminé !")
+                        envoyer_ack(client_socket, adresse_serveur, (p_seq + 1) % 2048, p_time, 63)
+                        transfert_termine = True
+                        break
+                        
+                    distance = (p_seq - seqnum_attendu) % 2048
+                    
+                    if p_seq == seqnum_attendu and p_len > 0:
+           
+                        fichier.write(payload)
+                        seqnum_attendu = (seqnum_attendu + 1) % 2048
+                        
+
+                        while seqnum_attendu in buffer_reception:
+                            fichier.write(buffer_reception.pop(seqnum_attendu))
+                            seqnum_attendu = (seqnum_attendu + 1) % 2048
+                            
+                        places_restantes = 63 - len(buffer_reception)
+                        envoyer_ack(client_socket, adresse_serveur, seqnum_attendu, p_time, places_restantes)
+                        
+                    elif 0 < distance < 64 and p_len > 0:
+                    
+                        buffer_reception[p_seq] = payload
+                        places_restantes = 63 - len(buffer_reception)
+                        envoyer_ack(client_socket, adresse_serveur, seqnum_attendu, p_time, places_restantes)
+                    else:
+     
+                        places_restantes = 63 - len(buffer_reception)
+                        envoyer_ack(client_socket, adresse_serveur, seqnum_attendu, p_time, places_restantes)
+                        
+            except ValueError:
+                pass 
+
+    finally:
+        fichier.close()
+        client_socket.close()
