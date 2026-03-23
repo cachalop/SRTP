@@ -1,235 +1,160 @@
-import argparse
-import os
 import socket
-import sys
+import struct
+import zlib
 import time
-
-from packet import Packet, PTYPE_DATA, PTYPE_ACK, PTYPE_SACK, MAX_PAYLOAD, SEQ_MOD
-
-
-# Paramètres du protocole côté serveur
-SOCKET_TIMEOUT = 0.05
-SEND_WINDOW_CAP = 31
-INITIAL_RTO = 0.5
+import select
+import os
+import argparse
+import sys
 
 
-# Log sur stderr (imposé)
-def log(msg):
+def print_err(msg):
     print(msg, file=sys.stderr)
 
+def encode_header(packet_type, window, length, seqnum, timestamp):
+    header_int = (packet_type << 30) | (window << 24) | (length << 11) | seqnum
+    partial_header = struct.pack("!II", header_int, timestamp)
+    crc1 = zlib.crc32(partial_header)
+    return partial_header + struct.pack("!I", crc1)
 
-# Timestamp utilisé pour RTT / retransmissions
-def now_ts():
-    return int(time.monotonic() * 1000) & 0xFFFFFFFF
+def decode_header(header_bytes):
+    if len(header_bytes) != 12:
+        raise ValueError("L'entête ne fait pas 12 octets !")
+    header_int, timestamp, crc1_recu = struct.unpack("!III", header_bytes)
+    if zlib.crc32(header_bytes[:8]) != crc1_recu:
+        raise ValueError("Erreur CRC1")
+    packet_type = (header_int >> 30) & 0x3
+    window = (header_int >> 24) & 0x3F
+    length = (header_int >> 11) & 0x1FFF
+    seqnum = header_int & 0x7FF
+    return packet_type, window, length, seqnum, timestamp
 
+def construire_paquet(packet_type, window, seqnum, timestamp, payload=b""):
+    length = len(payload)
+    entete = encode_header(packet_type, window, length, seqnum, timestamp)
+    if length == 0:
+        return entete
+    crc2_bytes = struct.pack("!I", zlib.crc32(payload))
+    return entete + payload + crc2_bytes
 
-# Différence circulaire de seqnum
-def seq_diff(a, b):
-    return (a - b) % SEQ_MOD
-
-
-# Parse la requête HTTP 0.9 (GET /path)
-def parse_request(payload):
-    try:
-        text = payload.decode("ascii")
-    except UnicodeDecodeError:
-        return None
-
-    if not text.startswith("GET "):
-        return None
-
-    path = text[4:].strip()
-    if not path.startswith("/"):
-        return None
-
-    return path
-
-
-# Sécurise l'accès au système de fichiers (évite ../)
-def safe_join(root, request_path):
-    relative = os.path.normpath(request_path.lstrip("/"))
-
-    if relative.startswith(".."):
-        return None
-
-    full = os.path.abspath(os.path.join(root, relative))
-    root_abs = os.path.abspath(root)
-
-    if os.path.commonpath([full, root_abs]) != root_abs:
-        return None
-
-    return full
-
-
-# Découpe le fichier en paquets DATA + paquet final vide
-def build_packets(file_path):
-    packets = []
-    seq = 0
-
-    # Si fichier inexistant → paquet vide
-    if not os.path.isfile(file_path):
-        packets.append(Packet(PTYPE_DATA, 0, 0, b"", now_ts()))
-        return packets
-
-    with open(file_path, "rb") as f:
-        while True:
-            chunk = f.read(MAX_PAYLOAD)
-            if not chunk:
-                break
-
-            packets.append(Packet(PTYPE_DATA, 0, seq, chunk, now_ts()))
-            seq = (seq + 1) % SEQ_MOD
-
-    # Paquet de fin
-    packets.append(Packet(PTYPE_DATA, 0, seq, b"", now_ts()))
-    return packets
-
-
-# Attend une requête valide du client
-def wait_request(sock):
-    while True:
-        try:
-            raw, client_addr = sock.recvfrom(2048)
-        except socket.timeout:
-            continue
-
-        pkt = Packet.decode(raw)
-
-        if pkt is None:
-            continue
-        if pkt.ptype != PTYPE_DATA:
-            continue
-        if pkt.seqnum != 0:
-            continue
-
-        path = parse_request(pkt.payload)
-        if path is None:
-            continue
-
-        return client_addr, path
-
-
-# Gestion du transfert fiable (fenêtre + retransmissions)
-def run_transfer(sock, client_addr, packets):
-    base = 0
-    next_to_send = 0
-    peer_window = 1
-    rto = INITIAL_RTO
-    in_flight = {}
-
-    while base < len(packets):
-        # Nombre de paquets autorisés à envoyer
-        allowed = min(SEND_WINDOW_CAP, max(1, peer_window))
-
-        # Envoi des nouveaux paquets dans la fenêtre
-        while next_to_send < len(packets) and (next_to_send - base) < allowed:
-            pkt = packets[next_to_send]
-            pkt.window = 0
-            pkt.timestamp = now_ts()
-            sock.sendto(pkt.encode(), client_addr)
-            in_flight[pkt.seqnum] = (next_to_send, time.monotonic(), pkt.timestamp)
-            next_to_send += 1
-
-        now = time.monotonic()
-
-        # Retransmission des paquets expirés (timeout)
-        for seqnum, (idx, sent_at, sent_ts) in list(in_flight.items()):
-            if now - sent_at >= rto:
-                pkt = packets[idx]
-                pkt.window = 0
-                pkt.timestamp = now_ts()
-                sock.sendto(pkt.encode(), client_addr)
-                in_flight[seqnum] = (idx, time.monotonic(), pkt.timestamp)
-
-        try:
-            raw, addr = sock.recvfrom(2048)
-        except socket.timeout:
-            continue
-
-        if addr != client_addr:
-            continue
-
-        ack = Packet.decode(raw)
-
-        # Ignore paquets invalides ou non ACK
-        if ack is None:
-            continue
-        if ack.ptype not in (PTYPE_ACK, PTYPE_SACK):
-            continue
-
-        peer_window = ack.window
-        ack_seq = ack.seqnum
-
-        # Avance la base (ACK cumulatif)
-        while base < len(packets) and packets[base].seqnum != ack_seq:
-            seq = packets[base].seqnum
-
-            if seq in in_flight:
-                idx, sent_at, sent_ts = in_flight[seq]
-
-                # Estimation simple du RTT → mise à jour du RTO
-                if sent_ts == ack.timestamp:
-                    sample = time.monotonic() - sent_at
-                    rto = max(0.2, min(2.0, 2.0 * sample))
-
-                del in_flight[seq]
-
-            base += 1
-
-        # Cas particulier : fenêtre du client à 0 → renvoyer périodiquement
-        if peer_window == 0 and base < len(packets):
-            seq = packets[base].seqnum
-            if seq in in_flight:
-                idx, sent_at, sent_ts = in_flight[seq]
-                if time.monotonic() - sent_at >= rto:
-                    pkt = packets[idx]
-                    pkt.window = 0
-                    pkt.timestamp = now_ts()
-                    sock.sendto(pkt.encode(), client_addr)
-                    in_flight[seq] = (idx, time.monotonic(), pkt.timestamp)
-
-    log("Transfer complete")
-
-
-def run_server(hostname, port, root):
-    # Socket UDP IPv6
-    sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    sock.settimeout(SOCKET_TIMEOUT)
-    sock.bind((hostname, port))
-
-    root = os.path.abspath(root)
-    log(f"Listening on [{hostname}]:{port}")
-
-    while True:
-        # Attente d'une requête
-        client_addr, request_path = wait_request(sock)
-        log(f"Request from {client_addr[0]}:{client_addr[1]} for {request_path}")
-
-        file_path = safe_join(root, request_path)
-
-        # Construction des paquets à envoyer
-        if file_path is None:
-            packets = [Packet(PTYPE_DATA, 0, 0, b"", now_ts())]
-        else:
-            packets = build_packets(file_path)
-
-        # Lancement du transfert
-        run_transfer(sock, client_addr, packets)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("hostname")
-    parser.add_argument("port", type=int)
-    parser.add_argument("--root", default=".", help="server root directory")
-    args = parser.parse_args()
-
-    try:
-        run_server(args.hostname, args.port, args.root)
-    except Exception as exc:
-        log(f"error: {exc}")
-        raise SystemExit(1)
+def lire_paquet_recu(paquet_bytes):
+    if len(paquet_bytes) < 12:
+        raise ValueError("Paquet trop court")
+    p_type, p_win, p_len, p_seq, p_time = decode_header(paquet_bytes[:12])
+    if p_len == 0:
+        return p_type, p_win, p_len, p_seq, p_time, b""
+    taille_attendue = 12 + p_len + 4
+    if len(paquet_bytes) < taille_attendue:
+        raise ValueError("Paquet tronqué")
+    payload = paquet_bytes[12 : 12+p_len]
+    crc2_recu = struct.unpack("!I", paquet_bytes[12+p_len : 12+p_len+4])[0]
+    if zlib.crc32(payload) != crc2_recu:
+        raise ValueError("Erreur CRC2")
+    return p_type, p_win, p_len, p_seq, p_time, payload
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Serveur SRTP C'Hokayy")
+    parser.add_argument("hostname", type=str, help="Adresse IPv6 ou nom de domaine")
+    parser.add_argument("port", type=int, help="Port d'écoute du serveur")
+    parser.add_argument("--root", type=str, default=".", help="Dossier racine pour les fichiers")
+    args = parser.parse_args()
+
+    HOST = args.hostname
+    PORT = args.port
+    RACINE = args.root
+    TIMEOUT = 2.0
+    MAX_PAYLOAD = 1024 
+
+    serveur_socket = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    serveur_socket.bind((HOST, PORT))
+
+    print_err(f" Serveur SRTP en écoute sur [{HOST}]:{PORT} (Racine: {RACINE})")
+
+    while True: 
+        print_err("\nEn attente d'une requête HTTP 0.9...")
+        
+        while True:
+            paquet_requete, adresse_client = serveur_socket.recvfrom(2000)
+            try:
+                p_type, p_win, p_len, p_seq, p_time, payload = lire_paquet_recu(paquet_requete)
+                if p_type == 1 and payload:
+                    requete_str = payload.decode('ascii')
+                    if requete_str.startswith("GET "): 
+                        chemin_demande = requete_str.split(" ")[1].lstrip('/')
+                        chemin_complet = os.path.join(RACINE, chemin_demande) 
+                        print_err(f"📞 Requête reçue de {adresse_client} : {requete_str}")
+                        break 
+            except ValueError:
+                pass
+
+
+        window_client = 1 
+        
+        morceaux_fichier = []
+        if os.path.exists(chemin_complet) and os.path.isfile(chemin_complet):
+            print_err(f"📂 Fichier trouvé. Découpage en cours...")
+            with open(chemin_complet, "rb") as f:
+                while True:
+                    chunk = f.read(MAX_PAYLOAD)
+                    if not chunk:
+                        break
+                    morceaux_fichier.append(chunk)
+        else:
+            print_err(f"Fichier introuvable ({chemin_complet}). Fin de connexion.")
+
+        paquets_en_vol = {}
+        prochain_index_a_envoyer = 0
+        total_morceaux = len(morceaux_fichier)
+        seqnum_actuel = (p_seq + 1) % 2048 
+        transfert_fini = False
+
+        print_err(f" Début de l'envoi ({total_morceaux} paquets)...")
+
+        while not transfert_fini:
+            
+            ready = select.select([serveur_socket], [], [], 0.05)
+            if ready[0]:
+                ack_bytes, _ = serveur_socket.recvfrom(1024)
+                try:
+                    a_type, a_win, a_len, a_seq, a_time, _ = lire_paquet_recu(ack_bytes)
+                    if a_type == 2: 
+                        
+                        window_client = a_win
+                        
+                        seqnums_en_vol = list(paquets_en_vol.keys())
+                        for seq in seqnums_en_vol:
+                            distance = (a_seq - seq) % 2048
+                            if distance < 1024 and distance > 0: 
+                                del paquets_en_vol[seq]
+                except ValueError:
+                    pass
+
+           
+            temps_actuel = time.time()
+            for seq, infos in paquets_en_vol.items():
+                if temps_actuel - infos['heure_envoi'] > TIMEOUT:
+                    serveur_socket.sendto(infos['paquet_bytes'], adresse_client)
+                    infos['heure_envoi'] = temps_actuel 
+
+            
+            while len(paquets_en_vol) < window_client and prochain_index_a_envoyer < total_morceaux:
+                donnees = morceaux_fichier[prochain_index_a_envoyer]
+                nouveau_paquet = construire_paquet(1, 0, seqnum_actuel, int(time.time()), donnees)
+                
+                paquets_en_vol[seqnum_actuel] = {
+                    'paquet_bytes': nouveau_paquet,
+                    'heure_envoi': time.time()
+                }
+                serveur_socket.sendto(nouveau_paquet, adresse_client)
+                
+                prochain_index_a_envoyer += 1
+                seqnum_actuel = (seqnum_actuel + 1) % 2048 
+
+            if prochain_index_a_envoyer == total_morceaux and len(paquets_en_vol) == 0:
+                paquet_fin = construire_paquet(1, 0, seqnum_actuel, int(time.time()), b"")
+                for _ in range(5): 
+                    serveur_socket.sendto(paquet_fin, adresse_client)
+                    time.sleep(0.05)
+                print_err(" Tous les paquets ont été acquittés. Fin de la session.")
+                transfert_fini = True
