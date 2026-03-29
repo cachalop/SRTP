@@ -1,18 +1,4 @@
-"""
-Suite de tests SRTP — pytest
-============================
-Couvre :
-  1. Encodage / décodage des en-têtes (champs, endianness, CRC1)
-  2. Paquet complet : payload, CRC2, Length > 1024, troncation, types
-  3. SACK : encodage / décodage du payload, padding, valeurs limites
-  4. RTT Estimator : convergence, bornes min/max
-  5. Envoi d'ACK et SACK (type 2 vs type 3)
-  6. Transferts de bout en bout sur réseau parfait
-  7. Transferts avec pertes, corruption, troncation simulées (proxy UDP)
-  8. Paquets malformés et robustesse du parsing
-  9. Cas limites : fichier introuvable, 1 octet, exactement 1024 octets,
-     seqnum wraparound, Window=0, fenêtre de réception
-"""
+
 
 import sys
 import os
@@ -35,19 +21,15 @@ from client import (
 from server import decode_sack_payload, RTTEstimator
 
 
-# ══════════════════════════════════════════════════════════════
-#  Helpers pour les tests d'intégration
-# ══════════════════════════════════════════════════════════════
+# fonction aide simuler server client
 
 def _find_free_port():
-    """Trouve un port UDP libre sur ::1."""
     with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
         s.bind(("::1", 0))
         return s.getsockname()[1]
 
 
 def _run_server(host, port, root, stop_event, started_event):
-    """Serveur SRTP embarqué pour les tests (SACK, Karn, window client)."""
     MAX_PAYLOAD = 1024
     sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -152,7 +134,6 @@ def _run_server(host, port, root, stop_event, started_event):
 
 
 def _run_client(host, port, path, save_path):
-    """Client SRTP embarqué pour les tests (SACK, fenêtre réelle)."""
     MAX_WIN = 63
     sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     sock.settimeout(3.0)
@@ -205,10 +186,9 @@ def _run_client(host, port, path, save_path):
     sock.close()
     return ok
 
-
+#proxy UDP simulant des conditions réseau 
 def _udp_proxy(listen_port, target_host, target_port, stop_event,
                started_event, drop_rate=0.0, corrupt_rate=0.0, truncate_rate=0.0):
-    """Proxy UDP bidirectionnel simulant des conditions réseau adverses."""
     proxy_sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     proxy_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     proxy_sock.bind(("::1", listen_port))
@@ -241,9 +221,9 @@ def _udp_proxy(listen_port, target_host, target_port, stop_event,
     proxy_sock.close()
 
 
-# ══════════════════════════════════════════════════════════════
-#  1. TESTS — Encodage / Décodage des en-têtes
-# ══════════════════════════════════════════════════════════════
+
+#encodage / décodage des en-têtes
+
 
 class TestEncodeDecodeHeader:
 
@@ -292,9 +272,9 @@ class TestEncodeDecodeHeader:
         assert seq == 0
 
 
-# ══════════════════════════════════════════════════════════════
-#  2. TESTS — Paquet complet
-# ══════════════════════════════════════════════════════════════
+
+#paquet complet
+
 
 class TestPaquetComplet:
 
@@ -352,9 +332,8 @@ class TestPaquetComplet:
         assert win == 0
 
 
-# ══════════════════════════════════════════════════════════════
-#  3. TESTS — SACK
-# ══════════════════════════════════════════════════════════════
+#SACK
+
 
 class TestSACK:
 
@@ -396,9 +375,8 @@ class TestSACK:
         s1.close(); s2.close()
 
 
-# ══════════════════════════════════════════════════════════════
-#  4. TESTS — RTT Estimator
-# ══════════════════════════════════════════════════════════════
+#RTT Estimator
+
 
 class TestRTTEstimator:
 
@@ -431,9 +409,7 @@ class TestRTTEstimator:
         assert e.rto == 2.0
 
 
-# ══════════════════════════════════════════════════════════════
-#  5. TESTS — Envoi ACK / SACK
-# ══════════════════════════════════════════════════════════════
+# Envoi ACK
 
 class TestEnvoiAckSack:
 
@@ -476,9 +452,8 @@ class TestEnvoiAckSack:
         s1.close(); s2.close()
 
 
-# ══════════════════════════════════════════════════════════════
-#  6. TESTS — Transfert réseau parfait
-# ══════════════════════════════════════════════════════════════
+
+# réseau parfait
 
 class TestTransfertParfait:
 
@@ -552,9 +527,7 @@ class TestTransfertParfait:
         self._xfer(tmp_path, "/nonexistent", b"")
 
 
-# ══════════════════════════════════════════════════════════════
-#  7. TESTS — Transfert avec pertes simulées
-# ══════════════════════════════════════════════════════════════
+#transfert avec pertes
 
 class TestTransfertAvecPertes:
 
@@ -602,11 +575,7 @@ class TestTransfertAvecPertes:
     def test_mixte(self, tmp_path):
         self._do(tmp_path, 5000, drop=0.05, corrupt=0.05, trunc=0.05)
 
-
-# ══════════════════════════════════════════════════════════════
-#  8. TESTS — Paquets malformés
-# ══════════════════════════════════════════════════════════════
-
+#paquets malformés
 class TestPaquetsMalformes:
 
     def test_paquet_vide(self):
@@ -633,9 +602,7 @@ class TestPaquetsMalformes:
         assert seq_distance(100, 100) == 0
 
 
-# ══════════════════════════════════════════════════════════════
-#  9. TESTS — Cas limites protocolaires
-# ══════════════════════════════════════════════════════════════
+#cas limites
 
 class TestCasLimites:
 
@@ -658,7 +625,7 @@ class TestCasLimites:
         assert w == 63
 
 
-# Helper
+# helper
 def _raises(fn):
     try:
         fn()
