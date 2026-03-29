@@ -13,14 +13,14 @@ def print_err(msg):
 
 # --- fonctions de décodage et de décodage ----------------------------------------------
 
-"""Encode un en-tête SRTP (12 octets) : Header32 | Timestamp | CRC1."""
+"""Encode une en-tête SRTP (12 octets) : Header32 | Timestamp | CRC1"""
 def encode_header(packet_type, window, length, seqnum, timestamp):
     header_int = (packet_type << 30) | (window << 24) | (length << 11) | seqnum
     partial_header = struct.pack("!II", header_int, timestamp)
     crc1 = zlib.crc32(partial_header) & 0xFFFFFFFF
     return partial_header + struct.pack("!I", crc1)
 
-"""Décode un en-tête SRTP de 12 octets. Lève ValueError si CRC1 invalide."""
+"""Décode un en-tête SRTP (12 octets). ValueError si CRC1 invalide."""
 def decode_header(header_bytes):
     if len(header_bytes) != 12:
         raise ValueError("L'en-tête ne fait pas 12 octets")
@@ -33,7 +33,7 @@ def decode_header(header_bytes):
     seqnum = header_int & 0x7FF
     return packet_type, window, length, seqnum, timestamp
 
-"""Construit un paquet SRTP complet (en-tête + payload + CRC2)."""
+"""Construit un paquet SRTP complet (en-tête + payload + CRC2)"""
 def construire_paquet(packet_type, window, seqnum, timestamp, payload=b""):
     length = len(payload)
     entete = encode_header(packet_type, window, length, seqnum, timestamp)
@@ -42,7 +42,7 @@ def construire_paquet(packet_type, window, seqnum, timestamp, payload=b""):
     crc2 = struct.pack("!I", zlib.crc32(payload) & 0xFFFFFFFF)
     return entete + payload + crc2
 
-"""Valide et décode un paquet SRTP complet. Lève ValueError si invalide."""
+"""décode un paquet SRTP complet. Lève ValueError si le paqeut est invalide."""
 def lire_paquet_recu(paquet_bytes):
     if len(paquet_bytes) < 12:
         raise ValueError("Paquet trop court")
@@ -86,11 +86,8 @@ def encode_sack_payload(seqnums):
     return bitstream.to_bytes(padded_bytes, 'big')
 
     
-    """Envoie un ACK ou SACK au serveur.
-
-    Si buffer_reception contient des paquets hors-séquence, envoie un SACK (type 3)
-    avec les seqnums reçus hors-séquence. Sinon, envoie un ACK classique (type 2).
-    """
+    """ Si le buffer_reception contient des paquets hors-séquence, envoie un SACK 
+    avec les seqnums reçus hors-séquence. Sinon il envoie un ACK classique """
 def envoyer_ack(sock, adresse_dest, prochain_seqnum_attendu, timestamp_recu, espaces_libres, buffer_reception=None):
     window_client = min(63, max(0, espaces_libres))
 
@@ -98,8 +95,8 @@ def envoyer_ack(sock, adresse_dest, prochain_seqnum_attendu, timestamp_recu, esp
     if buffer_reception:
         seqnums_hors_seq = sorted(buffer_reception.keys(),
                                   key=lambda s: (s - prochain_seqnum_attendu) % 2048)
-        # Limiter à 744 seqnums maximum (contrainte spec)
-        seqnums_hors_seq = seqnums_hors_seq[:744]
+        # Limiter à 744 seqnums maximum
+    seqnums_hors_seq = seqnums_hors_seq[:744]
 
     if seqnums_hors_seq:
         # PTYPE_SACK = 3
@@ -123,10 +120,8 @@ def seq_distance(a, b):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Client SRTP")
-    parser.add_argument("servername", type=str,
-                        help="URL du serveur (ex: http://[::1]:8080/llm/small)")
-    parser.add_argument("--save", type=str, default="llm.model",
-                        help="Chemin du fichier de sauvegarde (défaut: llm.model)")
+    parser.add_argument("servername", type=str, help="URL du serveur (ex: http://[::1]:8080/llm/small)")
+    parser.add_argument("--save", type=str, default="llm.model", help="Chemin du fichier de sauvegarde (défaut: llm.model)")
     args = parser.parse_args()
 
     url_decodee = urlparse(args.servername)
@@ -152,8 +147,8 @@ if __name__ == "__main__":
     print_err(f"Requête envoyée : GET {CHEMIN_DEMANDE} vers [{DEST_HOST}]:{DEST_PORT}")
 
     # Boucle de réception
-    seqnum_attendu = 1  # Le prochain seqnum DATA attendu (le premier DATA aura seqnum 1)
-    buffer_reception = {}  # seqnum → payload (paquets hors-séquence)
+    seqnum_attendu = 1  # Le prochain seqnum attendu
+    buffer_reception = {}
     transfert_termine = False
     nb_retries = 0
 
@@ -165,7 +160,7 @@ if __name__ == "__main__":
             try:
                 paquet, adresse_serveur = client_socket.recvfrom(2000)
             except socket.timeout:
-                # Retransmission de la requête initiale si pas de réponse
+                # Retransmission de la requête si le serveur ne répond pas 
                 nb_retries += 1
                 if nb_retries > MAX_RETRIES_REQUETE:
                     print_err("Timeout critique : nombre maximal de retransmissions atteint.")
@@ -179,19 +174,18 @@ if __name__ == "__main__":
             try:
                 p_type, p_win, p_len, p_seq, p_time, payload = lire_paquet_recu(paquet)
 
-                # Ignorer les types inconnus (seul DATA = 1 est attendu du serveur)
+                # on attends que du p_type = 1 du serveur
                 if p_type != 1:
                     continue
 
-                # ── Paquet de fin de transfert (Length = 0) ──
+                # Paquet de fin de transfert 
                 if p_len == 0 and p_seq == seqnum_attendu:
-                    print_err("Paquet de fin (Length=0) reçu. Transfert terminé !")
-                    envoyer_ack(client_socket, adresse_serveur,
-                                (p_seq + 1) % 2048, p_time, MAX_WINDOW)
+                    print_err("Transfert terminé !")
+                    envoyer_ack(client_socket, adresse_serveur, (p_seq + 1) % 2048, p_time, MAX_WINDOW)
                     transfert_termine = True
                     break
 
-                # ── Paquet de données ──
+                # Paquet de données
                 if p_len > 0:
                     distance = seq_distance(p_seq, seqnum_attendu)
 
@@ -199,9 +193,9 @@ if __name__ == "__main__":
                     # Un paquet est dans la fenêtre si 0 <= distance < window_annoncee
                     places_restantes = MAX_WINDOW - len(buffer_reception)
                     fenetre_recep = max(1, places_restantes)  # au moins 1 pour le paquet en séquence
-
-                    if distance == 0:
-                        # Paquet attendu en séquence
+                    
+                    # Paquet attendu
+                    if distance == 0:  
                         fichier.write(payload)
                         seqnum_attendu = (seqnum_attendu + 1) % 2048
 
@@ -216,8 +210,6 @@ if __name__ == "__main__":
                             buffer_reception[p_seq] = payload
 
                     else:
-                        # Paquet hors fenêtre → ignoré (spec : DOIT ignorer)
-                        # On envoie quand même l'ACK pour signaler seqnum_attendu
                         pass
 
                     places_restantes = MAX_WINDOW - len(buffer_reception)
@@ -228,7 +220,7 @@ if __name__ == "__main__":
                     nb_retries = 0
 
             except ValueError:
-                # Paquet corrompu, tronqué ou invalide → on l'ignore
+                # on ignore les paquets invalides
                 pass
 
     finally:
