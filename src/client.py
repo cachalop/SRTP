@@ -11,21 +11,17 @@ from urllib.parse import urlparse
 def print_err(msg):
     print(msg, file=sys.stderr)
 
+# --- fonctions de décodage et de décodage ----------------------------------------------
 
-# ──────────────────────────────────────────────────────────────
-#  Encodage / décodage des paquets SRTP
-# ──────────────────────────────────────────────────────────────
-
+"""Encode un en-tête SRTP (12 octets) : Header32 | Timestamp | CRC1."""
 def encode_header(packet_type, window, length, seqnum, timestamp):
-    """Encode un en-tête SRTP (12 octets) : Header32 | Timestamp | CRC1."""
     header_int = (packet_type << 30) | (window << 24) | (length << 11) | seqnum
     partial_header = struct.pack("!II", header_int, timestamp)
     crc1 = zlib.crc32(partial_header) & 0xFFFFFFFF
     return partial_header + struct.pack("!I", crc1)
 
-
+"""Décode un en-tête SRTP de 12 octets. Lève ValueError si CRC1 invalide."""
 def decode_header(header_bytes):
-    """Décode un en-tête SRTP de 12 octets. Lève ValueError si CRC1 invalide."""
     if len(header_bytes) != 12:
         raise ValueError("L'en-tête ne fait pas 12 octets")
     header_int, timestamp, crc1_recu = struct.unpack("!III", header_bytes)
@@ -37,9 +33,8 @@ def decode_header(header_bytes):
     seqnum = header_int & 0x7FF
     return packet_type, window, length, seqnum, timestamp
 
-
+"""Construit un paquet SRTP complet (en-tête + payload + CRC2)."""
 def construire_paquet(packet_type, window, seqnum, timestamp, payload=b""):
-    """Construit un paquet SRTP complet (en-tête + payload + CRC2)."""
     length = len(payload)
     entete = encode_header(packet_type, window, length, seqnum, timestamp)
     if length == 0:
@@ -47,9 +42,8 @@ def construire_paquet(packet_type, window, seqnum, timestamp, payload=b""):
     crc2 = struct.pack("!I", zlib.crc32(payload) & 0xFFFFFFFF)
     return entete + payload + crc2
 
-
+"""Valide et décode un paquet SRTP complet. Lève ValueError si invalide."""
 def lire_paquet_recu(paquet_bytes):
-    """Valide et décode un paquet SRTP complet. Lève ValueError si invalide."""
     if len(paquet_bytes) < 12:
         raise ValueError("Paquet trop court")
     p_type, p_win, p_len, p_seq, p_time = decode_header(paquet_bytes[:12])
@@ -73,12 +67,8 @@ def lire_paquet_recu(paquet_bytes):
     return p_type, p_win, p_len, p_seq, p_time, payload
 
 
-# ──────────────────────────────────────────────────────────────
-#  SACK (acquittements sélectifs)
-# ──────────────────────────────────────────────────────────────
-
+"""Encode une liste de seqnums (11 bits chacun) en payload SACK, paddé à 4 octets."""
 def encode_sack_payload(seqnums):
-    """Encode une liste de seqnums (11 bits chacun) en payload SACK, paddé à 4 octets."""
     if not seqnums:
         return b""
     total_bits = len(seqnums) * 11
@@ -95,14 +85,13 @@ def encode_sack_payload(seqnums):
 
     return bitstream.to_bytes(padded_bytes, 'big')
 
-
-def envoyer_ack(sock, adresse_dest, prochain_seqnum_attendu, timestamp_recu,
-                espaces_libres, buffer_reception=None):
+    
     """Envoie un ACK ou SACK au serveur.
 
     Si buffer_reception contient des paquets hors-séquence, envoie un SACK (type 3)
     avec les seqnums reçus hors-séquence. Sinon, envoie un ACK classique (type 2).
     """
+def envoyer_ack(sock, adresse_dest, prochain_seqnum_attendu, timestamp_recu, espaces_libres, buffer_reception=None):
     window_client = min(63, max(0, espaces_libres))
 
     seqnums_hors_seq = []
@@ -126,18 +115,11 @@ def envoyer_ack(sock, adresse_dest, prochain_seqnum_attendu, timestamp_recu,
     sock.sendto(paquet, adresse_dest)
 
 
-# ──────────────────────────────────────────────────────────────
-#  Distance séquentielle (arithmétique modulo 2048)
-# ──────────────────────────────────────────────────────────────
-
 def seq_distance(a, b):
-    """Retourne (a - b) mod 2048."""
     return (a - b) % 2048
 
 
-# ──────────────────────────────────────────────────────────────
-#  Programme principal : Client SRTP
-# ──────────────────────────────────────────────────────────────
+# --- programme main -------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Client SRTP")
@@ -160,7 +142,7 @@ if __name__ == "__main__":
     client_socket = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     client_socket.settimeout(RECV_TIMEOUT)
 
-    # ── Envoi de la requête HTTP 0.9 ──
+    # Envoi de la requete
     requete_http = f"GET {CHEMIN_DEMANDE}".encode('ascii')
     ts_requete = int(time.time() * 1000) & 0xFFFFFFFF
     paquet_requete = construire_paquet(1, MAX_WINDOW, 0, ts_requete, requete_http)
@@ -169,7 +151,7 @@ if __name__ == "__main__":
     client_socket.sendto(paquet_requete, dest_addr)
     print_err(f"Requête envoyée : GET {CHEMIN_DEMANDE} vers [{DEST_HOST}]:{DEST_PORT}")
 
-    # ── Boucle de réception ──
+    # Boucle de réception
     seqnum_attendu = 1  # Le prochain seqnum DATA attendu (le premier DATA aura seqnum 1)
     buffer_reception = {}  # seqnum → payload (paquets hors-séquence)
     transfert_termine = False
