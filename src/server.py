@@ -1,39 +1,49 @@
-import socket
-import struct
-import zlib
-import time
-import select
+import socket 
+import struct # pack unpack donne binaire
+import zlib # CRC32
+import time # timestamp
+import select #surveille socket sans bloquer
 import os
-import argparse
-import sys
+import argparse 
+import sys # pour print_err
 
 
 def print_err(msg):
     print(msg, file=sys.stderr)
 
 def encode_header(packet_type, window, length, seqnum, timestamp):
+    
     header_int = (packet_type << 30) | (window << 24) | (length << 11) | seqnum
+    
     partial_header = struct.pack("!II", header_int, timestamp)
+    
     crc1 = zlib.crc32(partial_header)
-    return partial_header + struct.pack("!I", crc1)
+    return partial_header + struct.pack("!I", crc1) #nombre de I = nbr d'entier de 32 bits
 
 def decode_header(header_bytes):
+    
     if len(header_bytes) != 12:
-        raise ValueError("L'entête ne fait pas 12 octets !")
+        raise ValueError("header != 12 octet")
+        
     header_int, timestamp, crc1_recu = struct.unpack("!III", header_bytes)
+    
     if zlib.crc32(header_bytes[:8]) != crc1_recu:
         raise ValueError("Erreur CRC1")
+        
     packet_type = (header_int >> 30) & 0x3
     window = (header_int >> 24) & 0x3F
     length = (header_int >> 11) & 0x1FFF
     seqnum = header_int & 0x7FF
+    
     return packet_type, window, length, seqnum, timestamp
 
 def construire_paquet(packet_type, window, seqnum, timestamp, payload=b""):
     length = len(payload)
     entete = encode_header(packet_type, window, length, seqnum, timestamp)
+    
     if length == 0:
         return entete
+        
     crc2_bytes = struct.pack("!I", zlib.crc32(payload))
     return entete + payload + crc2_bytes
 
