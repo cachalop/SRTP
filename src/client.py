@@ -23,10 +23,10 @@ def encode_header(packet_type, window, length, seqnum, timestamp):
 """Décode un en-tête SRTP (12 octets). ValueError si CRC1 invalide."""
 def decode_header(header_bytes):
     if len(header_bytes) != 12:
-        raise ValueError("L'en-tête ne fait pas 12 octets")
+        raise ValueError("en-tête invalide")
     header_int, timestamp, crc1_recu = struct.unpack("!III", header_bytes)
     if (zlib.crc32(header_bytes[:8]) & 0xFFFFFFFF) != crc1_recu:
-        raise ValueError("Erreur CRC1 : en-tête corrompu")
+        raise ValueError("Erreur CRC1 : en-tête corrompue")
     packet_type = (header_int >> 30) & 0x3
     window = (header_int >> 24) & 0x3F
     length = (header_int >> 11) & 0x1FFF
@@ -48,16 +48,16 @@ def lire_paquet_recu(paquet_bytes):
         raise ValueError("Paquet trop court")
     p_type, p_win, p_len, p_seq, p_time = decode_header(paquet_bytes[:12])
 
-    # Ignorer les paquets avec Length > 1024 (spécification)
+    # Ignorer les paquets avec Length > 1024
     if p_len > 1024:
-        raise ValueError("Length > 1024 : paquet ignoré")
+        raise ValueError("Length > 1024")
 
     if p_len == 0:
         return p_type, p_win, p_len, p_seq, p_time, b""
 
     taille_attendue = 12 + p_len + 4
     if len(paquet_bytes) < taille_attendue:
-        raise ValueError("Paquet tronqué par le réseau")
+        raise ValueError("Paquet non valide")
 
     payload = paquet_bytes[12: 12 + p_len]
     crc2_recu = struct.unpack("!I", paquet_bytes[12 + p_len: 12 + p_len + 4])[0]
@@ -67,13 +67,14 @@ def lire_paquet_recu(paquet_bytes):
     return p_type, p_win, p_len, p_seq, p_time, payload
 
 
-"""Encode une liste de seqnums (11 bits chacun) en payload SACK, paddé à 4 octets."""
+"""Encode une liste de seqnums en payload du packet SACK"""
 def encode_sack_payload(seqnums):
     if not seqnums:
         return b""
     total_bits = len(seqnums) * 11
     total_bytes = (total_bits + 7) // 8
-    # Padding à un multiple de 4 octets
+    
+    # Padding a un multiple de 4 octets
     padded_bytes = ((total_bytes + 3) // 4) * 4
 
     bitstream = 0
@@ -93,20 +94,17 @@ def envoyer_ack(sock, adresse_dest, prochain_seqnum_attendu, timestamp_recu, esp
 
     seqnums_hors_seq = []
     if buffer_reception:
-        seqnums_hors_seq = sorted(buffer_reception.keys(),
-                                  key=lambda s: (s - prochain_seqnum_attendu) % 2048)
-        # Limiter à 744 seqnums maximum
+        seqnums_hors_seq = sorted(buffer_reception.keys(), key=lambda s: (s - prochain_seqnum_attendu) % 2048)
+        # Limiter à 744 seqnums
     seqnums_hors_seq = seqnums_hors_seq[:744]
 
     if seqnums_hors_seq:
         # PTYPE_SACK = 3
         sack_payload = encode_sack_payload(seqnums_hors_seq)
-        paquet = construire_paquet(3, window_client, prochain_seqnum_attendu,
-                                   timestamp_recu, sack_payload)
+        paquet = construire_paquet(3, window_client, prochain_seqnum_attendu, timestamp_recu, sack_payload)
     else:
         # PTYPE_ACK = 2
-        entete_ack = encode_header(2, window_client, 0, prochain_seqnum_attendu,
-                                   timestamp_recu)
+        entete_ack = encode_header(2, window_client, 0, prochain_seqnum_attendu, timestamp_recu)
         paquet = entete_ack
 
     sock.sendto(paquet, adresse_dest)
