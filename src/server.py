@@ -50,6 +50,7 @@ def construire_paquet(packet_type, window, seqnum, timestamp, payload=b""):
 def lire_paquet_recu(paquet_bytes):
     if len(paquet_bytes) < 12:
         raise ValueError("Paquet trop court")
+        
     p_type, p_win, p_len, p_seq, p_time = decode_header(paquet_bytes[:12])
     if p_len == 0:
         return p_type, p_win, p_len, p_seq, p_time, b""
@@ -60,6 +61,7 @@ def lire_paquet_recu(paquet_bytes):
     crc2_recu = struct.unpack("!I", paquet_bytes[12+p_len : 12+p_len+4])[0]
     if zlib.crc32(payload) != crc2_recu:
         raise ValueError("Erreur CRC2")
+        
     return p_type, p_win, p_len, p_seq, p_time, payload
 
 
@@ -73,11 +75,11 @@ if __name__ == "__main__":
     HOST = args.hostname
     PORT = args.port
     RACINE = args.root
-    TIMEOUT = 2.0
+    TIMEOUT = 2.0 # temps avant reenvoi paquet non acké
     MAX_PAYLOAD = 1024 
 
-    serveur_socket = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-    serveur_socket.bind((HOST, PORT))
+    serveur_socket = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) #IPV6 et UDP
+    serveur_socket.bind((HOST, PORT)) # ecoute sur cette adresse/port
 
     print_err(f" Serveur SRTP en écoute sur [{HOST}]:{PORT} (Racine: {RACINE})")
 
@@ -85,10 +87,10 @@ if __name__ == "__main__":
         print_err("\nEn attente d'une requête HTTP 0.9...")
         
         while True:
-            paquet_requete, adresse_client = serveur_socket.recvfrom(2000)
+            paquet_requete, adresse_client = serveur_socket.recvfrom(2000) #attend paquet UDP
             try:
                 p_type, p_win, p_len, p_seq, p_time, payload = lire_paquet_recu(paquet_requete)
-                if p_type == 1 and payload:
+                if p_type == 1 and payload: # DATA et pas une fin de transfert
                     requete_str = payload.decode('ascii')
                     if requete_str.startswith("GET "): 
                         chemin_demande = requete_str.split(" ")[1].lstrip('/')
@@ -104,16 +106,17 @@ if __name__ == "__main__":
         morceaux_fichier = []
         if os.path.exists(chemin_complet) and os.path.isfile(chemin_complet):
             print_err(f"📂 Fichier trouvé. Découpage en cours...")
-            with open(chemin_complet, "rb") as f:
+            with open(chemin_complet, "rb") as f: #ouverture en binaire
                 while True:
                     chunk = f.read(MAX_PAYLOAD)
                     if not chunk:
-                        break
+                        break #fin du fichier
                     morceaux_fichier.append(chunk)
         else:
             print_err(f"Fichier introuvable ({chemin_complet}). Fin de connexion.")
 
-        paquets_en_vol = {}
+        paquets_en_vol = {} # Dict {seqnum -> {paquet_bytes, heure_envoi}}
+                               # = paquets envoyés mais pas encore ACKés
         prochain_index_a_envoyer = 0
         total_morceaux = len(morceaux_fichier)
         seqnum_actuel = (p_seq + 1) % 2048 
@@ -124,6 +127,8 @@ if __name__ == "__main__":
         while not transfert_fini:
             
             ready = select.select([serveur_socket], [], [], 0.05)
+            # Vérifie si un paquet est disponible, attend MAX 50ms
+            # Si on faisait recvfrom() directement => blocage => on pourrait pas retransmettre
             if ready[0]:
                 ack_bytes, _ = serveur_socket.recvfrom(1024)
                 try:
